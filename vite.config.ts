@@ -13,20 +13,26 @@ const { d1, r2 } = hostingConfig;
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const managedLinux = readExecutionProfile() === "managed-linux";
 
+const mediaRuntimeVars = Object.fromEntries(
+  [
+    "MEDIA_PROVIDER_URL",
+    "MEDIA_PROVIDER_TOKEN",
+    "MEDIA_PROVIDER_ALLOW_LOCAL",
+    "MEDIA_ASSET_ORIGINS",
+    "MEDIA_ADDITIONAL_HOSTS",
+  ]
+    .map((key) => [key, process.env[key]] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[1])),
+);
+
 const localBindingConfig = {
   main: "vinext/server/fetch-handler",
   compatibility_flags: ["nodejs_compat"],
-  // Expose the local media-provider connection to the Cloudflare Worker runtime.
-  // The Vite/Miniflare worker does not automatically inherit arbitrary parent
-  // process environment variables, so without these vars providerConfigured()
-  // sees an empty provider URL/token even though the Node provider is running.
-  vars: {
-    MEDIA_PROVIDER_URL: process.env.MEDIA_PROVIDER_URL ?? "",
-    MEDIA_PROVIDER_TOKEN: process.env.MEDIA_PROVIDER_TOKEN ?? "",
-    MEDIA_PROVIDER_ALLOW_LOCAL: process.env.MEDIA_PROVIDER_ALLOW_LOCAL ?? "",
-    MEDIA_ASSET_ORIGINS: process.env.MEDIA_ASSET_ORIGINS ?? "",
-    MEDIA_ADDITIONAL_HOSTS: process.env.MEDIA_ADDITIONAL_HOSTS ?? "",
-  },
+  // Keep runtime values configured in the Cloudflare dashboard when CI deploys.
+  // During local development, only non-empty parent-process values are injected.
+  // This avoids a production build replacing MEDIA_PROVIDER_URL with an empty string.
+  keep_vars: true,
+  ...(Object.keys(mediaRuntimeVars).length ? { vars: mediaRuntimeVars } : {}),
   d1_databases: d1
     ? [
         {
