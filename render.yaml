@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: viddow-media-provider
+    runtime: docker
+    plan: free
+    dockerfilePath: ./media-provider/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: VIDDOW_PROVIDER_TOKEN
+        generateValue: true
