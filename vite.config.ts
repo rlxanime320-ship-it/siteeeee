@@ -13,26 +13,23 @@ const { d1, r2 } = hostingConfig;
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const managedLinux = readExecutionProfile() === "managed-linux";
 
-const mediaRuntimeVars = Object.fromEntries(
-  [
-    "MEDIA_PROVIDER_URL",
-    "MEDIA_PROVIDER_TOKEN",
-    "MEDIA_PROVIDER_ALLOW_LOCAL",
-    "MEDIA_ASSET_ORIGINS",
-    "MEDIA_ADDITIONAL_HOSTS",
-  ]
-    .map((key) => [key, process.env[key]] as const)
-    .filter((entry): entry is readonly [string, string] => Boolean(entry[1])),
-);
+// The Render provider URL is public configuration, so keep it in the Worker
+// configuration. The token remains a Cloudflare Secret and is never committed.
+const mediaRuntimeVars: Record<string, string> = {
+  MEDIA_PROVIDER_URL: process.env.MEDIA_PROVIDER_URL || "https://viddow-media-provider.onrender.com",
+};
+for (const key of ["MEDIA_PROVIDER_ALLOW_LOCAL", "MEDIA_ASSET_ORIGINS", "MEDIA_ADDITIONAL_HOSTS"] as const) {
+  const value = process.env[key];
+  if (value) mediaRuntimeVars[key] = value;
+}
 
 const localBindingConfig = {
   main: "vinext/server/fetch-handler",
   compatibility_flags: ["nodejs_compat"],
-  // Keep runtime values configured in the Cloudflare dashboard when CI deploys.
-  // During local development, only non-empty parent-process values are injected.
-  // This avoids a production build replacing MEDIA_PROVIDER_URL with an empty string.
+  // Preserve dashboard-managed values (especially MEDIA_PROVIDER_TOKEN) when
+  // Wrangler deploys a new version from GitHub.
   keep_vars: true,
-  ...(Object.keys(mediaRuntimeVars).length ? { vars: mediaRuntimeVars } : {}),
+  vars: mediaRuntimeVars,
   d1_databases: d1
     ? [
         {
@@ -53,18 +50,13 @@ const localBindingConfig = {
 };
 
 export default defineConfig(async () => {
-  // Use Miniflare's local Request.cf placeholder unless fetching is requested.
   process.env.CLOUDFLARE_CF_FETCH_ENABLED ??= "false";
   process.env.WRANGLER_SEND_METRICS ??= "false";
-
-  // Keep Wrangler and Miniflare state project-local. These are non-secret tool
-  // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= "false";
   process.env.WRANGLER_LOG_PATH ??= ".wrangler/logs";
   process.env.WRANGLER_REGISTRY_PATH ??= ".wrangler/dev-registry";
   process.env.MINIFLARE_REGISTRY_PATH ??= ".wrangler/registry";
 
-  // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
