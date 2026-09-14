@@ -77,6 +77,21 @@ function supportedUrl(value) {
   }
 }
 
+function isYouTubeUrl(url) {
+  const host = String(url?.hostname || "").toLowerCase();
+  return host === "youtube.com" || host === "www.youtube.com" || host === "m.youtube.com" || host === "youtu.be";
+}
+
+const YOUTUBE_PUBLIC_EXTRACTION_PROFILES = [
+  { name: "default", args: [] },
+  // yt-dlp maintainers currently recommend combining the normal client with
+  // web_embedded when logged-out/public extraction loses usable formats.
+  { name: "web_embedded", args: ["--extractor-args", "youtube:player_client=default,web_embedded"] },
+  // Last public-only fallback: avoid the initial webpage request and use the
+  // embedded player API. No cookies, account session, or private-media access.
+  { name: "web_embedded_no_webpage", args: ["--extractor-args", "youtube:player_client=web_embedded;player_skip=webpage"] },
+];
+
 function safeRemoteAssetUrl(value) {
   if (typeof value !== "string" || value.length < 1 || value.length > 16_000) return null;
   try {
@@ -272,10 +287,7 @@ async function runYtDlp(args, options = {}) {
   const tool = await findYtDlp();
   if (!tool) throw Object.assign(new Error("yt-dlp is not installed or not available on PATH."), { code: "YTDLP_MISSING" });
   const ffmpeg = FFMPEG_OVERRIDE ? ["--ffmpeg-location", FFMPEG_OVERRIDE] : [];
-  // The Render image already uses Node 22. Current yt-dlp releases can use it
-  // for YouTube's external JS challenge solver when the EJS package is installed.
-  const jsRuntime = ["--js-runtimes", "node"];
-  return run(tool.command, [...tool.prefix, "--ignore-config", ...jsRuntime, ...ffmpeg, ...args], options);
+  return run(tool.command, [...tool.prefix, "--ignore-config", ...ffmpeg, ...args], options);
 }
 
 function platformName(info) {
@@ -455,19 +467,8 @@ function classifyYtDlpError(error) {
   return { status: 502, code: "MEDIA_UNAVAILABLE", message: "The source could not be processed. It may be unavailable or temporarily blocking requests." };
 }
 
-
-function providerDiagnostic(error, sourceUrl) {
-  const raw = `${error?.message || ""}\n${error?.processResult?.stderr || ""}\n${error?.processResult?.stdout || ""}`.trim();
-  const source = sourceUrl?.href || "";
-  return raw
-    .replaceAll(source, "[source-url]")
-    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]")
-    .replace(/[\r\n]+/g, " | ")
-    .slice(-3500);
-}
-
 async function analyze(url) {
-  const result = await runYtDlp([
+  const baseArgs = [
     "--no-playlist",
     "--skip-download",
     "--dump-single-json",
@@ -476,7 +477,32 @@ async function analyze(url) {
     "--retries", "2",
     "--fragment-retries", "2",
     "--", url.href,
-  ], { timeout: 75_000 });
+  ];
+
+  const profiles = isYouTubeUrl(url)
+    ? YOUTUBE_PUBLIC_EXTRACTION_PROFILES
+    : [{ name: "default", args: [] }];
+
+  let result;
+  let selectedToolArgs = [];
+  let lastError;
+  for (const profile of profiles) {
+    try {
+      result = await runYtDlp([...profile.args, ...baseArgs], { timeout: 75_000 });
+      selectedToolArgs = profile.args;
+      if (profile.name !== "default") {
+        console.log(`[VIDdow media provider] YouTube public fallback succeeded profile=${profile.name}`);
+      }
+      break;
+    } catch (error) {
+      lastError = error;
+      if (!isYouTubeUrl(url) || profile === profiles[profiles.length - 1]) throw error;
+      const text = String(error?.processResult?.stderr || error?.message || "").replace(/\s+/g, " ").slice(0, 500);
+      console.warn(`[VIDdow media provider] YouTube profile failed profile=${profile.name} :: ${text}`);
+    }
+  }
+  if (!result) throw lastError || new Error("YouTube extraction failed.");
+
   const info = JSON.parse(result.stdout);
   if (!info || typeof info !== "object") throw new Error("The media engine returned invalid metadata.");
   const { formats, mapping } = buildFormats(info);
@@ -484,7 +510,14 @@ async function analyze(url) {
   const reference = randomBytes(18).toString("hex");
   const thumbnail = selectThumbnail(info);
   const preview = selectPreview(info);
-  analyses.set(reference, { url: url.href, mapping, thumbnail, preview, expiresAt: Date.now() + ANALYSIS_TTL_MS });
+  analyses.set(reference, {
+    url: url.href,
+    mapping,
+    thumbnail,
+    preview,
+    toolArgs: selectedToolArgs,
+    expiresAt: Date.now() + ANALYSIS_TTL_MS,
+  });
   return {
     id: reference,
     title: cleanText(info.title, 300) || "Untitled media",
@@ -521,6 +554,7 @@ async function runDownloadJob(job, analysis, selection) {
     };
     if (selection.kind === "audio") {
       const args = [
+        ...(analysis.toolArgs || []),
         ...common,
         "-f", "bestaudio/best",
         "-x",
@@ -532,6 +566,7 @@ async function runDownloadJob(job, analysis, selection) {
       await runYtDlp(args, { timeout: 20 * 60_000, maxOutput: 6 * 1024 * 1024, onLine });
     } else {
       const args = [
+        ...(analysis.toolArgs || []),
         ...common,
         "-f", selection.selector,
         ...(selection.mergeContainer === "mp4" || selection.mergeContainer === "webm" ? ["--merge-output-format", selection.mergeContainer] : []),
@@ -639,15 +674,9 @@ const server = createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const url = supportedUrl(body?.url);
       if (!url) return providerError(res, 400, "UNSUPPORTED_SOURCE", "Use a public HTTPS link from YouTube, TikTok, Instagram, Facebook, X, or Vimeo.");
-      console.log(`[VIDdow media provider] analyze start host=${url.hostname}`);
-      try {
-        const result = await analyze(url);
-        console.log(`[VIDdow media provider] analyze ok host=${url.hostname} source=${result.source} formats=${result.formats.length}`);
-        return json(res, 200, result);
-      }
+      try { return json(res, 200, await analyze(url)); }
       catch (error) {
         const issue = classifyYtDlpError(error);
-        console.error(`[VIDdow media provider] analyze failed host=${url.hostname} status=${issue.status} code=${issue.code} :: ${providerDiagnostic(error, url)}`);
         return providerError(res, issue.status, issue.code, issue.message);
       }
     }
