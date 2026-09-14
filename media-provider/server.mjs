@@ -272,7 +272,10 @@ async function runYtDlp(args, options = {}) {
   const tool = await findYtDlp();
   if (!tool) throw Object.assign(new Error("yt-dlp is not installed or not available on PATH."), { code: "YTDLP_MISSING" });
   const ffmpeg = FFMPEG_OVERRIDE ? ["--ffmpeg-location", FFMPEG_OVERRIDE] : [];
-  return run(tool.command, [...tool.prefix, "--ignore-config", ...ffmpeg, ...args], options);
+  // The Render image already uses Node 22. Current yt-dlp releases can use it
+  // for YouTube's external JS challenge solver when the EJS package is installed.
+  const jsRuntime = ["--js-runtimes", "node"];
+  return run(tool.command, [...tool.prefix, "--ignore-config", ...jsRuntime, ...ffmpeg, ...args], options);
 }
 
 function platformName(info) {
@@ -452,6 +455,17 @@ function classifyYtDlpError(error) {
   return { status: 502, code: "MEDIA_UNAVAILABLE", message: "The source could not be processed. It may be unavailable or temporarily blocking requests." };
 }
 
+
+function providerDiagnostic(error, sourceUrl) {
+  const raw = `${error?.message || ""}\n${error?.processResult?.stderr || ""}\n${error?.processResult?.stdout || ""}`.trim();
+  const source = sourceUrl?.href || "";
+  return raw
+    .replaceAll(source, "[source-url]")
+    .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]")
+    .replace(/[\r\n]+/g, " | ")
+    .slice(-3500);
+}
+
 async function analyze(url) {
   const result = await runYtDlp([
     "--no-playlist",
@@ -625,9 +639,15 @@ const server = createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const url = supportedUrl(body?.url);
       if (!url) return providerError(res, 400, "UNSUPPORTED_SOURCE", "Use a public HTTPS link from YouTube, TikTok, Instagram, Facebook, X, or Vimeo.");
-      try { return json(res, 200, await analyze(url)); }
+      console.log(`[VIDdow media provider] analyze start host=${url.hostname}`);
+      try {
+        const result = await analyze(url);
+        console.log(`[VIDdow media provider] analyze ok host=${url.hostname} source=${result.source} formats=${result.formats.length}`);
+        return json(res, 200, result);
+      }
       catch (error) {
         const issue = classifyYtDlpError(error);
+        console.error(`[VIDdow media provider] analyze failed host=${url.hostname} status=${issue.status} code=${issue.code} :: ${providerDiagnostic(error, url)}`);
         return providerError(res, issue.status, issue.code, issue.message);
       }
     }
